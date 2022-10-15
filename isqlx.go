@@ -147,11 +147,11 @@ func (d *dbx) GetSQLX() *sqlx.DB {
 }
 
 func (d *dbx) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return getContext(ctx, d.tracer, d.GetContext, d.driver, d.config, d.DB.Stats(), dest, query, args...)
+	return getContext(ctx, d.tracer, d.DB.GetContext, d.driver, d.config, d.DB.Stats(), dest, query, args...)
 }
 
 func (d *dbx) SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return selectContext(ctx, d.tracer, d.SelectContext, d.driver, d.config, d.DB.Stats(), dest, query, args)
+	return selectContext(ctx, d.tracer, d.DB.SelectContext, d.driver, d.config, d.DB.Stats(), dest, query, args...)
 }
 
 func (d *dbx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
@@ -168,11 +168,11 @@ func (d *dbx) Begin(_ context.Context) (TX, error) {
 }
 
 func (t *tx) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return getContext(ctx, t.tracer, t.GetContext, t.driver, t.config, t.db.Stats(), dest, query, args...)
+	return getContext(ctx, t.tracer, t.TX.GetContext, t.driver, t.config, t.db.Stats(), dest, query, args...)
 }
 
 func (t *tx) SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return selectContext(ctx, t.tracer, t.SelectContext, t.driver, t.config, t.db.Stats(), dest, query, args)
+	return selectContext(ctx, t.tracer, t.TX.SelectContext, t.driver, t.config, t.db.Stats(), dest, query, args...)
 }
 
 func (t *tx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
