@@ -7,18 +7,23 @@ import (
 	"log"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
+type ExecFunc = func(ctx context.Context, query string, arg ...interface{}) (sql.Result, error)
+type GetFunc = func(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+type SelectFunc = func(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+
 // Querier is an interface which exposes functions to run queries. It's a subset
 // of sqlx library functions.
 type Querier interface {
 	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
 	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
-	NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
 // DBX is an interface to make single queries without leveraging transactions.
@@ -40,23 +45,84 @@ type TX interface {
 	TxClose(ctx context.Context)
 }
 
-// TODO: if instead of taking the actual sql.DB we took the connection details,
-// these could be tracked in a per-span basis.
-func NewMySQLDBX(db *sql.DB, tracer trace.Tracer) DBX {
-	d := sqlx.NewDb(db, "mysql")
-	return &dbx{DB: d, driver: "mysql", tracer: tracer}
+type DBConfig struct {
+	Host                          string
+	Port                          int
+	User                          string
+	Password                      string
+	Name                          string
+	MaxConnections                int
+	MaxIdleConnections            int
+	ConnectionLifetimeSeconds     time.Duration
+	IdleConnectionLifetimeSeconds time.Duration
+}
+
+func (c *DBConfig) DSN() string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+		c.User,
+		c.Password,
+		c.Host,
+		c.Port,
+		c.Name,
+	)
+}
+
+const (
+	DefaultMaxConnections                = 20
+	DefaultMaxIdleConnections            = 10
+	DefaultConnectionLifetimeSeconds     = time.Duration(180) // default to 3 minutes
+	DefaultIdleConnectionLifeTimeSeconds = time.Duration(60)  // default to 1 minute
+)
+
+func NewMySQLDBXFromConfig(config *DBConfig, tracer trace.Tracer) (DBX, error) {
+	db, err := sql.Open("mysql", config.DSN())
+	if err != nil {
+		return nil, fmt.Errorf("unable to open database: %w", err)
+	}
+
+	maxConnections := DefaultMaxConnections
+	if config.MaxConnections != 0 {
+		maxConnections = config.MaxConnections
+	}
+
+	maxIdleConnections := DefaultMaxIdleConnections
+	if config.MaxIdleConnections != 0 {
+		maxIdleConnections = config.MaxIdleConnections
+	}
+
+	connectionLifetimeSeconds := DefaultConnectionLifetimeSeconds
+	if config.ConnectionLifetimeSeconds != 0 {
+		connectionLifetimeSeconds = config.ConnectionLifetimeSeconds
+	}
+
+	idleConnectionLifetimeSeconds := DefaultIdleConnectionLifeTimeSeconds
+	if config.IdleConnectionLifetimeSeconds != 0 {
+		idleConnectionLifetimeSeconds = config.IdleConnectionLifetimeSeconds
+	}
+
+	db.SetMaxOpenConns(maxConnections)
+	db.SetMaxIdleConns(maxIdleConnections)
+	db.SetConnMaxLifetime(time.Second * connectionLifetimeSeconds)
+	db.SetConnMaxIdleTime(time.Second * idleConnectionLifetimeSeconds)
+
+	driver := "mysql"
+	d := sqlx.NewDb(db, driver)
+	return &dbx{DB: d, driver: driver, config: config, tracer: tracer}, nil
 }
 
 type dbx struct {
 	DB     *sqlx.DB
 	driver string
 	tracer trace.Tracer
+	config *DBConfig
 }
 
 type tx struct {
+	db     *sqlx.DB
 	TX     *sqlx.Tx
 	driver string
 	tracer trace.Tracer
+	config *DBConfig
 }
 
 func (d *dbx) GetSQLX() *sqlx.DB {
@@ -64,15 +130,15 @@ func (d *dbx) GetSQLX() *sqlx.DB {
 }
 
 func (d *dbx) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return getContext(ctx, d, d.tracer, d.driver, dest, query, args)
+	return getContext(ctx, d.tracer, d.GetContext, d.driver, d.config, d.DB.Stats(), dest, query, args...)
 }
 
 func (d *dbx) SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return selectContext(ctx, d, d.tracer, d.driver, dest, query, args)
+	return selectContext(ctx, d.tracer, d.SelectContext, d.driver, d.config, d.DB.Stats(), dest, query, args)
 }
 
-func (d *dbx) NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error) {
-	return namedExecContext(ctx, d, d.tracer, d.driver, query, arg)
+func (d *dbx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return execContext(ctx, d.tracer, d.DB.ExecContext, d.driver, d.config, d.DB.Stats(), query, args...)
 }
 
 func (d *dbx) Begin(_ context.Context) (TX, error) {
@@ -81,23 +147,23 @@ func (d *dbx) Begin(_ context.Context) (TX, error) {
 		return nil, err
 	}
 
-	return &tx{TX: t, driver: d.driver, tracer: d.tracer}, nil
+	return &tx{TX: t, db: d.DB, driver: d.driver, tracer: d.tracer, config: d.config}, nil
 }
 
 func (t *tx) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return getContext(ctx, t, t.tracer, t.driver, dest, query, args...)
+	return getContext(ctx, t.tracer, t.GetContext, t.driver, t.config, t.db.Stats(), dest, query, args...)
 }
 
 func (t *tx) SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
-	return selectContext(ctx, t, t.tracer, t.driver, dest, query, args)
+	return selectContext(ctx, t.tracer, t.SelectContext, t.driver, t.config, t.db.Stats(), dest, query, args)
 }
 
-func (t *tx) NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error) {
-	return namedExecContext(ctx, t, t.tracer, t.driver, query, arg)
+func (t *tx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return execContext(ctx, t.tracer, t.TX.ExecContext, t.driver, t.config, t.db.Stats(), query, args...)
 }
 
 func (t *tx) Commit(ctx context.Context) error {
-	_, span := newSpan(ctx, t.driver, "commit", t.tracer)
+	_, span := newSpan(ctx, t.driver, "commit", t.config, t.db.Stats(), t.tracer)
 	defer span.End()
 
 	err := t.TX.Commit()
@@ -112,7 +178,7 @@ func (t *tx) Commit(ctx context.Context) error {
 // a `defer` statement so it can rollback transactions even in the case of
 // panics.
 func (t *tx) TxClose(ctx context.Context) {
-	_, span := newSpan(ctx, t.driver, "rollback", t.tracer)
+	_, span := newSpan(ctx, t.driver, "rollback", t.config, t.db.Stats(), t.tracer)
 	defer span.End()
 
 	if r := recover(); r != nil {
@@ -129,13 +195,23 @@ func (t *tx) TxClose(ctx context.Context) {
 	}
 }
 
-func getContext(ctx context.Context, q Querier, tracer trace.Tracer, driver string, dest interface{}, query string, args ...interface{}) error {
-	ctx, span := newSpan(ctx, driver, query, tracer)
+func getContext(
+	ctx context.Context,
+	tracer trace.Tracer,
+	getFn GetFunc,
+	driver string,
+	config *DBConfig,
+	stats sql.DBStats,
+	dest interface{},
+	query string,
+	args ...interface{},
+) error {
+	ctx, span := newSpan(ctx, driver, query, config, stats, tracer)
 	defer span.End()
 
 	span.addQueryParams(args)
 
-	err := q.GetContext(ctx, dest, query, args...)
+	err := getFn(ctx, dest, query, args...)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			span.addAffectedRowsAttribute(0)
@@ -147,13 +223,23 @@ func getContext(ctx context.Context, q Querier, tracer trace.Tracer, driver stri
 	return err
 }
 
-func selectContext(ctx context.Context, q Querier, tracer trace.Tracer, driver string, dest interface{}, query string, args ...interface{}) error {
-	ctx, span := newSpan(ctx, driver, query, tracer)
+func selectContext(
+	ctx context.Context,
+	tracer trace.Tracer,
+	selectFn SelectFunc,
+	driver string,
+	config *DBConfig,
+	stats sql.DBStats,
+	dest interface{},
+	query string,
+	args ...interface{},
+) error {
+	ctx, span := newSpan(ctx, driver, query, config, stats, tracer)
 	defer span.End()
 
 	span.addQueryParams(args)
 
-	err := q.SelectContext(ctx, dest, query, args...)
+	err := selectFn(ctx, dest, query, args...)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			span.addAffectedRowsAttribute(0)
@@ -167,19 +253,20 @@ func selectContext(ctx context.Context, q Querier, tracer trace.Tracer, driver s
 	return err
 }
 
-func namedExecContext(ctx context.Context, q Querier, tracer trace.Tracer, driver string, query string, arg interface{}) (sql.Result, error) {
-	ctx, span := newSpan(ctx, driver, query, tracer)
+func execContext(
+	ctx context.Context,
+	tracer trace.Tracer,
+	execFn ExecFunc,
+	driver string,
+	config *DBConfig,
+	stats sql.DBStats,
+	query string,
+	args ...interface{},
+) (sql.Result, error) {
+	ctx, span := newSpan(ctx, driver, query, config, stats, tracer)
 	defer span.End()
 
-	// I'm not sure if there are more use cases other than a map, but to be safe,
-	// I decided to wrap it in a conditional. As we find new, let's just add them here though.
-	if m, ok := arg.(map[string]interface{}); ok {
-		for k, v := range m {
-			span.addQueryParamAttribute(k, fmt.Sprint(v))
-		}
-	}
-
-	r, err := q.NamedExecContext(ctx, query, arg)
+	r, err := execFn(ctx, query, args...)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			span.RecordError(err)
@@ -232,19 +319,18 @@ type customSpan struct {
 	trace.Span
 }
 
-func newSpan(ctx context.Context, driver, query string, tracer trace.Tracer) (context.Context, *customSpan) {
+func newSpan(ctx context.Context, driver, query string, config *DBConfig, stats sql.DBStats, tracer trace.Tracer) (context.Context, *customSpan) {
+	name := inferSpanName(query, config.Name)
+	ctx, span := tracer.Start(ctx, name)
+	custom := customSpan{span}
+
 	op := parseQueryOperation(query)
+	addDatabaseQueryAttributes(&custom, query, op)
+	addDatabaseSystemAttributes(&custom, driver)
+	addDatabaseConnectionAttributes(&custom, config.Host, config.Port, config.Name, config.User)
+	addDatabaseStatsAttributes(&custom, stats)
 
-	ctx, span := tracer.Start(ctx, fmt.Sprintf("%s.%s", driver, op))
-	defer span.End()
-
-	span.SetAttributes(
-		attribute.String("db.system", driver),
-		attribute.String("db.operation", op),
-		attribute.String("db.statement", query),
-	)
-
-	return ctx, &customSpan{span}
+	return ctx, &custom
 }
 
 func (s *customSpan) addQueryParams(args ...interface{}) {
@@ -260,4 +346,124 @@ func (s *customSpan) addAffectedRowsAttribute(n int64) {
 
 func (s *customSpan) addQueryParamAttribute(k, v string) {
 	s.SetAttributes(attribute.String(fmt.Sprintf("db.statement.param_%s", k), v))
+}
+
+func addDatabaseSystemAttributes(s *customSpan, driver string) {
+	s.SetAttributes(attribute.String("db.system", driver))
+}
+
+func addDatabaseConnectionAttributes(s *customSpan, host string, port int, dbName, user string) {
+	if s == nil {
+		return
+	}
+
+	s.SetAttributes(
+		attribute.String("net.peer.transport", "IP.TCP"),
+		attribute.String("net.peer.name", host),
+		attribute.Int("net.peer.port", port),
+		attribute.String("db.name", dbName),
+		attribute.String("db.user", user),
+	)
+}
+
+func addDatabaseQueryAttributes(s *customSpan, query, operation string) {
+	if s == nil {
+		return
+	}
+
+	s.SetAttributes(
+		attribute.String("db.statement", query),
+		attribute.String("db.operation", operation),
+	)
+}
+
+func addDatabaseStatsAttributes(s *customSpan, stats sql.DBStats) {
+	if s == nil {
+		return
+	}
+
+	s.SetAttributes(
+		// Pool config
+		attribute.Int("db.sql.max_open_connection", stats.MaxOpenConnections),
+
+		// Pool status
+		attribute.Int("db.sql.open_connections", stats.OpenConnections),
+		attribute.Int("db.sql.in_use", stats.InUse),
+		attribute.Int("db.sql.idle", stats.Idle),
+
+		// Counters
+		attribute.Int64("db.sql.wait_count", stats.WaitCount),
+		attribute.Int64("db.sql.wait_duration_ms", stats.WaitDuration.Milliseconds()),
+		attribute.Int64("db.sql.max_idle_closed", stats.MaxIdleClosed),
+		attribute.Int64("db.sql.max_idle_time_closed", stats.MaxIdleTimeClosed),
+		attribute.Int64("db.sql.max_life_time_closed", stats.MaxLifetimeClosed),
+	)
+}
+
+func inferSpanName(statement, database string) string { //nolint: gocyclo
+	operation := parseQueryOperation(statement)
+
+	var tableName string
+	var awkwardScenario bool
+
+	// Incredibly naive way to extract the table name from the query.  This will
+	// work for simple queries, but it will not work for any query that contains
+	// funny joins, inner selects, or other complex constructs.
+	arr := strings.Split(statement, " ")
+	for k, v := range arr {
+		// Inserts are always in the form of "INSERT INTO table_name".
+		if strings.EqualFold(v, "insert") && len(arr) > k+2 {
+			tableName = arr[k+2]
+			break
+		}
+
+		// Inserts are always in the form of "UPDATE table_name".
+		if strings.EqualFold(v, "update") && len(arr) > k+1 {
+			tableName = arr[k+1]
+			break
+		}
+
+		// Deletes are always in the form of "DELETE FROM table_name".
+		// It's also relevant for the algorithm to check for deletes before
+		// selects because they both contain a "FROM" keyword.
+		if strings.EqualFold(v, "delete") && len(arr) > k+2 {
+			tableName = arr[k+2]
+			break
+		}
+
+		// Selects can be "awkward".
+		if strings.EqualFold(v, "from") && len(arr) > k+1 {
+			if strings.Contains(arr[k+1], "(") || strings.Contains(arr[k+1], "select") {
+				awkwardScenario = true
+			} else {
+				tableName = arr[k+1]
+			}
+
+			break
+		}
+	}
+
+	if awkwardScenario {
+		if database == "" {
+			return strings.ToUpper(operation)
+		}
+		return fmt.Sprintf("%s %s", strings.ToUpper(operation), database)
+	}
+
+	// If we couldn't infer the table name, no database name was provided and
+	// the operation couldn't be inferred (this could be the case of a random
+	// string), then just flag it in the span name.
+	if database == "" && tableName == "" {
+		if operation == "unknown" {
+			return "Unknown database operation"
+		}
+
+		return strings.ToUpper(operation)
+	}
+
+	if database == "" {
+		return fmt.Sprintf("%s %s", strings.ToUpper(operation), tableName)
+	}
+
+	return fmt.Sprintf("%s %s.%s", strings.ToUpper(operation), database, tableName)
 }
