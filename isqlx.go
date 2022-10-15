@@ -335,7 +335,7 @@ func newSpan(ctx context.Context, driver, query string, config *DBConfig, stats 
 func (s *customSpan) addQueryParams(args ...interface{}) {
 	for i := range args {
 		v := fmt.Sprint(args[i])
-		s.addQueryParams(i, v)
+		s.addQueryParamAttribute(fmt.Sprint(i), fmt.Sprint(v))
 	}
 }
 
