@@ -74,8 +74,8 @@ const (
 	DefaultIdleConnectionLifeTimeSeconds = time.Duration(60)  // default to 1 minute
 )
 
-func NewMySQLDBXFromConfig(config *DBConfig, tracer trace.Tracer) (DBX, error) {
-	db, err := sql.Open("mysql", config.DSN())
+func NewDBXFromConfig(driver string, config *DBConfig, tracer trace.Tracer) (DBX, error) {
+	db, err := sql.Open(driver, config.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("unable to open database: %w", err)
 	}
@@ -105,7 +105,6 @@ func NewMySQLDBXFromConfig(config *DBConfig, tracer trace.Tracer) (DBX, error) {
 	db.SetConnMaxLifetime(time.Second * connectionLifetimeSeconds)
 	db.SetConnMaxIdleTime(time.Second * idleConnectionLifetimeSeconds)
 
-	driver := "mysql"
 	d := sqlx.NewDb(db, driver)
 	return &dbx{DB: d, driver: driver, config: config, tracer: tracer}, nil
 }
