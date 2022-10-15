@@ -57,14 +57,27 @@ type DBConfig struct {
 	IdleConnectionLifetimeSeconds time.Duration
 }
 
-func (c *DBConfig) DSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
-		c.User,
-		c.Password,
-		c.Host,
-		c.Port,
-		c.Name,
-	)
+func (c *DBConfig) DSN(driver string) (string, error) {
+	switch driver {
+	case "pgx":
+		return fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
+			c.User,
+			c.Password,
+			c.Host,
+			c.Port,
+			c.Name,
+		), nil
+	case "mysql":
+		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+			c.User,
+			c.Password,
+			c.Host,
+			c.Port,
+			c.Name,
+		), nil
+	}
+
+	return "", fmt.Errorf("unsupported driver, currently only pgx and mysql are supported")
 }
 
 const (
@@ -75,7 +88,12 @@ const (
 )
 
 func NewDBXFromConfig(driver string, config *DBConfig, tracer trace.Tracer) (DBX, error) {
-	db, err := sql.Open(driver, config.DSN())
+	dsn, err := config.DSN(driver)
+	if err != nil {
+		return nil, fmt.Errorf("building DSN for connection: %w", err)
+	}
+
+	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("unable to open database: %w", err)
 	}
