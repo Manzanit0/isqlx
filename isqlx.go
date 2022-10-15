@@ -112,6 +112,9 @@ func (t *tx) Commit(ctx context.Context) error {
 // a `defer` statement so it can rollback transactions even in the case of
 // panics.
 func (t *tx) TxClose(ctx context.Context) {
+	_, span := newSpan(ctx, t.driver, "rollback", t.tracer)
+	defer span.End()
+
 	if r := recover(); r != nil {
 		log.Printf("recovered an error in TxClose(): %#v", r)
 		_ = t.TX.Rollback()
@@ -190,14 +193,18 @@ func namedExecContext(ctx context.Context, q Querier, tracer trace.Tracer, drive
 
 func parseQueryOperation(query string) string {
 	query = strings.ToLower(query)
-	if strings.Contains(query, "update") { // nolint: gocritic
-		return "UPDATE"
-	} else if strings.Contains(query, "select") {
-		return "SELECT"
-	} else if strings.Contains(query, "insert") {
-		return "INSERT"
-	} else if strings.Contains(query, "delete") {
-		return "DELETE"
+	if strings.HasPrefix(query, "update") { // nolint: gocritic
+		return "update"
+	} else if strings.HasPrefix(query, "select") {
+		return "select"
+	} else if strings.HasPrefix(query, "insert") {
+		return "insert"
+	} else if strings.HasPrefix(query, "delete") {
+		return "delete"
+	} else if strings.HasPrefix(query, "commit") {
+		return "commit"
+	} else if strings.HasPrefix(query, "rollback") {
+		return "rollback"
 	}
 
 	return "unknown"
