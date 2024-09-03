@@ -1,5 +1,8 @@
 # isqlx
 
+> [!WARNING]  
+> Repository deprecated see https://github.com/XSAM/otelsql instead for a better approach.
+
 A limited wrapper around `jmoiron/sqlx` with instrumentation through OTEL tracers.
 
 The idea is that you can add it as a drop-in replacement for `jmoiron/sqlx` and
